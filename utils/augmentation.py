@@ -3,7 +3,6 @@
 # https://github.com/ildoonet/pytorch-randaugment/blob/master/RandAugment/augmentations.py
 # https://github.com/google-research/fixmatch/blob/master/third_party/auto_augment/augmentations.py
 # https://github.com/google-research/fixmatch/blob/master/libml/ctaugment.py
-import logging
 import random
 
 import numpy as np
@@ -12,9 +11,7 @@ import PIL.ImageOps
 import PIL.ImageEnhance
 import PIL.ImageDraw
 from PIL import Image
-from audioop import bias
 
-logger = logging.getLogger(__name__)
 
 PARAMETER_MAX = 10
 RESAMPLE_MODE = None
