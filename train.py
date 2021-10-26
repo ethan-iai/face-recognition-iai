@@ -24,12 +24,14 @@ from functools import partial
 from backbone.cbam import CBAMResNet
 from backbone.attention import ResidualAttentionNet_56, ResidualAttentionNet_92
 
+from margin.InnerProduct import InnerProduct
 from margin.ArcMarginProduct import ArcMarginProduct
 from margin.MultiMarginProduct import MultiMarginProduct
 from margin.CosineMarginProduct import CosineMarginProduct
-from margin.InnerProduct import InnerProduct
+from margin.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
+from utils.visualize import Visualizer
 
 backbones = {
     'Res50_IR'      :   partial(CBAMResNet.__init__, 50, mode='ir'),
@@ -45,7 +47,7 @@ margins = {
     'MultiMargin'   :   MultiMarginProduct.__init__,
     'CosFace'       :   CosineMarginProduct.__init__,
     'Softmax'       :   InnerProduct.__init__, 
-    'SphereFace'    :   NotImplementedError.__init__,
+    'SphereFace'    :   SphereMarginProduct.__init__,
 }
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
@@ -172,7 +174,7 @@ def main_worker(gpu, ngpus_per_node, args):
     
     # create margin
     print("=> creatinig margin '{}'".format(args.margin))
-    margin = margins[args.backbone](in_feature=args.feature_dim, 
+    margin = margins[args.margin](in_feature=args.feature_dim, 
                                     out_feature=None, s=None)
 
     if args.distributed:
@@ -237,6 +239,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
+    
+    # TODO: add data properties
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -304,7 +308,8 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, path)
 
 
-def train(train_loader, net, margin, criterion, optimizer, lr_scheduler, epoch, args):
+def train(train_loader, net, margin, criterion, 
+          optimizer, lr_scheduler, epoch, args, visualizer=None):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -318,9 +323,7 @@ def train(train_loader, net, margin, criterion, optimizer, lr_scheduler, epoch, 
 
     # switch to train mode
     net.train()
-    
-    # FIXME: 
-    # margin.train()
+    margin.train()
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -355,8 +358,18 @@ def train(train_loader, net, margin, criterion, optimizer, lr_scheduler, epoch, 
         if i % args.print_freq == 0:
             progress.display(i)
 
+            if visualizer is not None:
+                visualizer.plot_curves({'softmax loss': loss.item()}, 
+                                iters=(epoch * args.batch_size + i), 
+                                title='train loss', xlabel='iters', ylabel='train loss')
+                visualizer.plot_curves({'train accuracy': acc1[0]}, 
+                                iters=(epoch * args.batch_size + i), 
+                                title='Acc@1', xlabel='iters', ylabel='Acc@1')
 
-def validate(val_loader, net, margin, criterion, args):
+
+
+def validate(val_loader, net, margin, criterion, 
+             epoch, args, visualizer=None):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -368,7 +381,7 @@ def validate(val_loader, net, margin, criterion, args):
 
     # switch to evaluate mode
     net.eval()
-    margin.train()
+    margin.eval()
 
     with torch.no_grad():
         end = time.time()
@@ -397,6 +410,12 @@ def validate(val_loader, net, margin, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+        
+        if visualizer is not None:
+            visualizer.plot_curves({'Acc@1': top1.avg, 'Acc@5': top5.avg},
+                                iters=epoch, title='test accuracy', 
+                                xlabel='iters', ylabel='Accs')
+                
 
     return top1.avg
 
