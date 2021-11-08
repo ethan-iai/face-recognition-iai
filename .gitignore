@@ -128,8 +128,17 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# editor & IDE config 
+.vscode
+
 # logs 
 *.log
 
 # data
 data/*
+
+# model checkpoints
+model/*
+
+# certain shell scripts
+train.sh
