@@ -22,7 +22,7 @@ class Meter(metaclass=ABCMeta):
 class AverageMeter(Meter):
     """Computes and stores the average and current value"""
     def __init__(self, name, fmt=':f'):
-        Meter.__init__(name, fmt)
+        super(AverageMeter, self).__init__(name, fmt)
 
     def reset(self):
         self.val = 0
@@ -54,6 +54,6 @@ class ProgressMeter(object):
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
+        fmt = '{:0' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
