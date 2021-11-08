@@ -60,7 +60,7 @@ parser.add_argument('--backbone', metavar='BACKBONE', default='Res50_IR',
                         ' (default: resnet50)')
 parser.add_argument('--margin', type=str, default='ArcFace', 
                     help='ArcFace, CosFace, SphereFace, MultiMargin, Softmax')
-parser.add_argument('--feature_dim', type=int, default=512, 
+parser.add_argument('--feature-dim', type=int, default=512, 
                     help='feature dimension, 128 or 512')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
@@ -169,7 +169,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     
     # create model
-    print("=> creating net '{}'".format(args.backbone))
+    print("=> creating backbone '{}'".format(args.backbone))
     net = backbones[args.backbone](feature_dim=args.feature_dim)
     
     # create margin
@@ -241,8 +241,8 @@ def main_worker(gpu, ngpus_per_node, args):
     valdir = os.path.join(args.data, 'val')
     
     # TODO: add data properties
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                     std=[0.5, 0.5, 0.5])
 
     train_dataset = datasets.ImageFolder(
         traindir,
@@ -253,6 +253,8 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
+    # TODO: add augmented data
+
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
@@ -262,10 +264,11 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
+    # FIXME: centrecrop may corp some useful info 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(128),
+            transforms.CenterCrop(112),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -296,7 +299,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if ((not args.multiprocessing_distributed or 
             (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)) and
             epoch % args.save_freq == 0):
-            filename="checkpoint-{}.pth.tar".format(epoch)
+            filename="checkpoint-{:06d}.pth.tar".format(epoch)
             path = os.path.join(args.save_dir, filename)
             save_checkpoint({
                 'epoch': epoch + 1,
