@@ -31,23 +31,27 @@ from margin.CosineMarginProduct import CosineMarginProduct
 from margin.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
-from utils.visualize import Visualizer
+
+# TODO: implement visualizer
+# from utils.visualize import Visualizer
 
 backbones = {
-    'Res50_IR'      :   partial(CBAMResNet.__init__, 50, mode='ir'),
-    'SERes50_IR'    :   partial(CBAMResNet.__init__, 50, mode='ir_se'),
-    'Res100_IR'     :   partial(CBAMResNet.__init__, 100, mode='ir'),
-    'SERes100_IR'   :   partial(CBAMResNet.__init__, 100, mode='ir_se'),
-    'Attention_56'  :   ResidualAttentionNet_56.__init__,
-    'Attention_92'  :   ResidualAttentionNet_92.__init__,
+    'Res50_IR'      :   partial(CBAMResNet, num_layers=50, mode='ir'),
+    'SERes50_IR'    :   partial(CBAMResNet, num_layers=50, mode='ir_se'),
+    'Res100_IR'     :   partial(CBAMResNet, num_layers=100, mode='ir'),
+    'SERes100_IR'   :   partial(CBAMResNet, num_layers=100, mode='ir_se'),
+    'Res152_IR'     :   partial(CBAMResNet, num_layers=152, mode='ir'),
+    'SERes152_IR'   :   partial(CBAMResNet, num_layers=152, mode='ir_se'),
+    'Attention_56'  :   ResidualAttentionNet_56,
+    'Attention_92'  :   ResidualAttentionNet_92,
 }
 
 margins = {
-    'ArcFace'       :   ArcMarginProduct.__init__,
-    'MultiMargin'   :   MultiMarginProduct.__init__,
-    'CosFace'       :   CosineMarginProduct.__init__,
-    'Softmax'       :   InnerProduct.__init__, 
-    'SphereFace'    :   SphereMarginProduct.__init__,
+    'ArcFace'       :   ArcMarginProduct,
+    'MultiMargin'   :   MultiMarginProduct,
+    'CosFace'       :   CosineMarginProduct,
+    'Softmax'       :   InnerProduct, 
+    'SphereFace'    :   SphereMarginProduct,
 }
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
@@ -62,6 +66,10 @@ parser.add_argument('--margin', type=str, default='ArcFace',
                     help='ArcFace, CosFace, SphereFace, MultiMargin, Softmax')
 parser.add_argument('--feature-dim', type=int, default=512, 
                     help='feature dimension, 128 or 512')
+parser.add_argument('--scale-size', type=float, default=32.0,
+                    help='scale size')
+parser.add_argument('--n-classes', type=int, default=1000,
+                    help='number of classes')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
@@ -86,7 +94,7 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('-s', '--save-freq', default=1000, type=int,
                     metavar='N', help='save checkpoints frequency (default: 1000)')
-parser.add_argument('--resume', action='store_true', type=str, metavar='PATH',
+parser.add_argument('--resume', type=str, default='', metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
@@ -117,7 +125,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.save_dir):
-        os.makedir(args.save_dir)
+        os.makedirs(args.save_dir)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -175,7 +183,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # create margin
     print("=> creatinig margin '{}'".format(args.margin))
     margin = margins[args.margin](in_feature=args.feature_dim, 
-                                    out_feature=None, s=None)
+                                  out_feature=args.n_classes, 
+                                  s=args.scale_size)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -217,7 +226,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
     # optionally resume from a checkpoint
-    if args.resume:
+    if len(args.resume) > 0:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
@@ -247,7 +256,8 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.Resize(128),
+            transforms.RandomResizedCrop(112),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
@@ -282,15 +292,16 @@ def main_worker(gpu, ngpus_per_node, args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        # adjust_learning_rate(optimizer, epoch, args)
-        exp_lr_scheduler.step()
 
         # train for one epoch
         train(train_loader, net, margin, criterion, 
               optimizer, exp_lr_scheduler, epoch, args)
 
+        # adjust_learning_rate
+        exp_lr_scheduler.step()
+
         # evaluate on validation set
-        acc1 = validate(val_loader, net, margin, criterion, args)
+        acc1 = validate(val_loader, net, margin, criterion, epoch, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -302,23 +313,24 @@ def main_worker(gpu, ngpus_per_node, args):
             filename="checkpoint-{:06d}.pth.tar".format(epoch)
             path = os.path.join(args.save_dir, filename)
             save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'net_state_dict': net.state_dict(),
-                'margin_state_dict': margin.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
+                'epoch'             :   epoch + 1,
+                'backbone'          :   args.backbone,
+                'margin'            :   args.margin,
+                'net_state_dict'    :   net.state_dict(),
+                'margin_state_dict' :   margin.state_dict(),
+                'best_acc1'         :   best_acc1,
+                'optimizer'         :   optimizer.state_dict(),
             }, is_best, path)
 
 
 def train(train_loader, net, margin, criterion, 
           optimizer, lr_scheduler, epoch, args, visualizer=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
+    batch_time = AverageMeter('Time', ':5.3f')
+    data_time = AverageMeter('Data', ':5.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    learning_rate = Meter('learnig rate', '6.2f')
+    top1 = AverageMeter('Acc@1', ':6.02f')
+    top5 = AverageMeter('Acc@5', ':6.02f')
+    learning_rate = Meter('learnig rate', ':.4e')
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, learning_rate, data_time, losses, top1, top5],
@@ -426,7 +438,11 @@ def validate(val_loader, net, margin, criterion,
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(
+            filename, 
+            os.path.join(os.path.dirname(filename),
+                         'model_best.pth.tar')
+        )
 
 
 def adjust_learning_rate(optimizer, epoch, args):
