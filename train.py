@@ -24,11 +24,11 @@ from functools import partial
 from backbone.cbam import CBAMResNet
 from backbone.attention import ResidualAttentionNet_56, ResidualAttentionNet_92
 
-from margin.InnerProduct import InnerProduct
-from margin.ArcMarginProduct import ArcMarginProduct
-from margin.MultiMarginProduct import MultiMarginProduct
-from margin.CosineMarginProduct import CosineMarginProduct
-from margin.SphereMarginProduct import SphereMarginProduct
+from metrics.InnerProduct import InnerProduct
+from metrics.ArcMarginProduct import ArcMarginProduct
+from metrics.MultiMarginProduct import MultiMarginProduct
+from metrics.CosineMarginProduct import CosineMarginProduct
+from metrics.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
 
@@ -46,7 +46,7 @@ backbones = {
     'Attention_92'  :   ResidualAttentionNet_92,
 }
 
-margins = {
+metircs = {
     'ArcFace'       :   ArcMarginProduct,
     'MultiMargin'   :   MultiMarginProduct,
     'CosFace'       :   CosineMarginProduct,
@@ -62,12 +62,15 @@ parser.add_argument('--backbone', metavar='BACKBONE', default='Res50_IR',
                     help='model architecture: ' +
                         ' | '.join(backbones.keys()) +
                         ' (default: resnet50)')
-parser.add_argument('--margin', type=str, default='ArcFace', 
+parser.add_argument('--metric', type=str, default='ArcFace', 
+                    choices=metircs.keys(),
                     help='ArcFace, CosFace, SphereFace, MultiMargin, Softmax')
 parser.add_argument('--feature-dim', type=int, default=512, 
                     help='feature dimension, 128 or 512')
+parser.add_argument('-m', '--margin', type=float, default=0.5,
+                    help='margin m in Arc face')
 parser.add_argument('--scale-size', type=float, default=32.0,
-                    help='scale size')
+                    help='scale s in Arcface')
 parser.add_argument('--n-classes', type=int, default=1000,
                     help='number of classes')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
@@ -180,11 +183,15 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating backbone '{}'".format(args.backbone))
     net = backbones[args.backbone](feature_dim=args.feature_dim)
     
-    # create margin
-    print("=> creatinig margin '{}'".format(args.margin))
-    margin = margins[args.margin](in_feature=args.feature_dim, 
+    # create metric
+    print("=> creatinig metric '{}'".format(args.metric))
+    kwargs = {
+        's' :   args.scale_size,
+        'm' :   args.margin
+    }
+    metric = metircs[args.metric](in_feature=args.feature_dim, 
                                   out_feature=args.n_classes, 
-                                  s=args.scale_size)
+                                  **kwargs)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -193,34 +200,34 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             net.cuda(args.gpu)
-            margin.cuda(args.gpu)
+            metric.cuda(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu])
-            margin = torch.nn.parallel.DistributedDataParallel(margin, device_ids=[args.gpu])
+            metric = torch.nn.parallel.DistributedDataParallel(metric, device_ids=[args.gpu])
         else:
             net.cuda()
-            margin.cuda(args.gpu)
+            metric.cuda(args.gpu)
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             net = torch.nn.parallel.DistributedDataParallel(net)
-            margin = torch.nn.parallel.DistributedDataParallel(margin, device_ids=[args.gpu])
+            metric = torch.nn.parallel.DistributedDataParallel(metric, device_ids=[args.gpu])
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         net = net.cuda(args.gpu)
-        margin = margin.cuda(args.gpu)
+        metric = metric.cuda(args.gpu)
     else:
         net = torch.nn.DataParallel(net).cuda()
-        margin = torch.nn.DataParallel(margin).cuda()
+        metric = torch.nn.DataParallel(metric).cuda()
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     optimizer = torch.optim.SGD([
         {'params': net.parameters(), 'weight_decay': 5e-4},
-        {'params': margin.parameters(), 'weight_decay': 5e-4}
+        {'params': metric.parameters(), 'weight_decay': 5e-4}
     ], args.lr, momentum=args.momentum, nesterov=True)
     exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[6, 11, 16], gamma=0.1)
 
@@ -236,7 +243,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             net.load_state_dict(checkpoint['net_state_dict'])
-            margin.load_state_dict(checkpoint['margin_state_dict'])
+            metric.load_state_dict(checkpoint['margin_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -286,7 +293,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, net, margin, criterion, args)
+        validate(val_loader, net, metric, criterion, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -294,14 +301,14 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, net, margin, criterion, 
+        train(train_loader, net, metric, criterion, 
               optimizer, exp_lr_scheduler, epoch, args)
 
         # adjust_learning_rate
         exp_lr_scheduler.step()
 
         # evaluate on validation set
-        acc1 = validate(val_loader, net, margin, criterion, epoch, args)
+        acc1 = validate(val_loader, net, metric, criterion, epoch, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -315,15 +322,15 @@ def main_worker(gpu, ngpus_per_node, args):
             save_checkpoint({
                 'epoch'             :   epoch + 1,
                 'backbone'          :   args.backbone,
-                'margin'            :   args.margin,
+                'metric'            :   args.metric,
                 'net_state_dict'    :   net.state_dict(),
-                'margin_state_dict' :   margin.state_dict(),
+                'margin_state_dict' :   metric.state_dict(),
                 'best_acc1'         :   best_acc1,
                 'optimizer'         :   optimizer.state_dict(),
             }, is_best, path)
 
 
-def train(train_loader, net, margin, criterion, 
+def train(train_loader, net, metric, criterion, 
           optimizer, lr_scheduler, epoch, args, visualizer=None):
     batch_time = AverageMeter('Time', ':5.3f')
     data_time = AverageMeter('Data', ':5.3f')
@@ -338,7 +345,7 @@ def train(train_loader, net, margin, criterion,
 
     # switch to train mode
     net.train()
-    margin.train()
+    metric.train()
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -351,7 +358,7 @@ def train(train_loader, net, margin, criterion,
 
         # compute output
         raw_logits = net(images)
-        output = margin(raw_logits, target)
+        output = metric(raw_logits, target)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -383,7 +390,7 @@ def train(train_loader, net, margin, criterion,
 
 
 
-def validate(val_loader, net, margin, criterion, 
+def validate(val_loader, net, metric, criterion, 
              epoch, args, visualizer=None):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -396,7 +403,7 @@ def validate(val_loader, net, margin, criterion,
 
     # switch to evaluate mode
     net.eval()
-    margin.eval()
+    metric.eval()
 
     with torch.no_grad():
         end = time.time()
