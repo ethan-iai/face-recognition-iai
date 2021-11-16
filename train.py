@@ -3,7 +3,6 @@ import os
 import random
 import shutil
 import time
-from urllib import parse
 import warnings
 
 import torch
@@ -17,7 +16,6 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torchvision.models as models
 
 from functools import partial
 
@@ -31,6 +29,7 @@ from margin.CosineMarginProduct import CosineMarginProduct
 from margin.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
+from utils.augmentation import RandAugment
 
 # TODO: implement visualizer
 # from utils.visualize import Visualizer
@@ -92,7 +91,7 @@ parser.add_argument('--save-dir', type=str, default='./model',
                     help='directory to save model checkpoint')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
-parser.add_argument('-s', '--save-freq', default=1000, type=int,
+parser.add_argument('--save-freq', default=1000, type=int,
                     metavar='N', help='save checkpoints frequency (default: 1000)')
 parser.add_argument('--resume', type=str, default='', metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -123,6 +122,8 @@ best_acc1 = 0
 
 def main():
     args = parser.parse_args()
+
+    print(args)
 
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
@@ -222,7 +223,9 @@ def main_worker(gpu, ngpus_per_node, args):
         {'params': net.parameters(), 'weight_decay': 5e-4},
         {'params': margin.parameters(), 'weight_decay': 5e-4}
     ], args.lr, momentum=args.momentum, nesterov=True)
-    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[6, 11, 16], gamma=0.1)
+
+    # NOTE: set lr decays here
+    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[], gamma=0.1)
 
 
     # optionally resume from a checkpoint
@@ -235,8 +238,8 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            net.load_state_dict(checkpoint['net_state_dict'])
-            margin.load_state_dict(checkpoint['margin_state_dict'])
+            net.load_state_dict(checkpoint['net_state_dict'], strict=False)
+            margin.load_state_dict(checkpoint['margin_state_dict'], strict=False)
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -253,7 +256,7 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                      std=[0.5, 0.5, 0.5])
 
-    train_dataset = datasets.ImageFolder(
+    original_train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
             transforms.Resize(128),
@@ -263,7 +266,20 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
-    # TODO: add augmented data
+    augmented_train_dataset = datasets.ImageFolder(
+        traindir,
+        transforms.Compose([
+            transforms.Resize(128),
+            transforms.RandomResizedCrop(112),
+            RandAugment(n=2, m=10),
+            transforms.ToTensor(),
+            normalize
+        ])
+    )
+
+    train_dataset = torch.utils.data.ConcatDataset([
+        original_train_dataset, augmented_train_dataset
+    ])
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -310,8 +326,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if ((not args.multiprocessing_distributed or 
             (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)) and
             epoch % args.save_freq == 0):
-            filename="checkpoint-{:06d}.pth.tar".format(epoch)
-            path = os.path.join(args.save_dir, filename)
+            filename = f"checkpoint-{epoch}.pth.tar"
             save_checkpoint({
                 'epoch'             :   epoch + 1,
                 'backbone'          :   args.backbone,
@@ -320,7 +335,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'margin_state_dict' :   margin.state_dict(),
                 'best_acc1'         :   best_acc1,
                 'optimizer'         :   optimizer.state_dict(),
-            }, is_best, path)
+            }, is_best, args.save_dir, filename)
 
 
 def train(train_loader, net, margin, criterion, 
@@ -435,13 +450,13 @@ def validate(val_loader, net, margin, criterion,
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, save_dir='', filename='checkpoint.pth.tar'):
+    file_path = os.path.join(save_dir, filename)
+    torch.save(state, file_path)
     if is_best:
         shutil.copyfile(
-            filename, 
-            os.path.join(os.path.dirname(filename),
-                         'model_best.pth.tar')
+            file_path, 
+            os.path.join(save_dir, 'model_best.pth.tar')
         )
 
 
