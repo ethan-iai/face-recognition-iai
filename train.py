@@ -30,9 +30,10 @@ from metrics.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
 from utils.augmentation import RandAugment
-
 # TODO: implement visualizer
 # from utils.visualize import Visualizer
+
+from test import validate
 
 backbones = {
     'Res50_IR'      :   partial(CBAMResNet, num_layers=50, mode='ir'),
@@ -68,7 +69,7 @@ parser.add_argument('--feature-dim', type=int, default=512,
                     help='feature dimension, 128 or 512')
 parser.add_argument('-m', '--margin', type=float, default=0.5,
                     help='margin m in Arc face')
-parser.add_argument('--scale-size', type=float, default=32.0,
+parser.add_argument('-s', '--scale', type=float, default=32.0,
                     help='scale s in Arcface')
 parser.add_argument('--n-classes', type=int, default=1000,
                     help='number of classes')
@@ -121,7 +122,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
-
+best_thres = 0
 
 def main():
     args = parser.parse_args()
@@ -165,6 +166,7 @@ def main():
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
+    global best_thres
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -187,7 +189,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # create metric
     print("=> creatinig metric '{}'".format(args.metric))
     kwargs = {
-        's' :   args.scale_size,
+        's' :   args.scale,
         'm' :   args.margin
     }
     metric = metircs[args.metric](in_feature=args.feature_dim, 
@@ -232,26 +234,27 @@ def main_worker(gpu, ngpus_per_node, args):
     ], args.lr, momentum=args.momentum, nesterov=True)
 
     # NOTE: set lr decays here
-    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[], gamma=0.1)
+    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[400, 800, 1200], gamma=0.1)
 
 
     # optionally resume from a checkpoint
     if len(args.resume) > 0:
         if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            print("==> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location=torch.device(args.gpu))
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
+            # best_thres = checkpoint['best_thres']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             net.load_state_dict(checkpoint['net_state_dict'], strict=False)
             metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
             optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
+            print("==> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print("==> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
@@ -298,18 +301,22 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     # FIXME: centrecrop may corp some useful info 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
+    val_dataset = datasets.ImageFolder(valdir, transforms.Compose([
             transforms.Resize(128),
             transforms.CenterCrop(112),
             transforms.ToTensor(),
             normalize,
-        ])),
+    ]))
+    val_dataset_size = len(val_dataset)
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, net, metric, criterion, args)
+        validate(val_loader, val_dataset_size, net, 
+                 args.start_epoch, args, visualizer=None)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -324,11 +331,13 @@ def main_worker(gpu, ngpus_per_node, args):
         exp_lr_scheduler.step()
 
         # evaluate on validation set
-        acc1 = validate(val_loader, net, metric, criterion, epoch, args)
+        thres, acc1 = validate(val_loader, val_dataset, net, 
+                               epoch, args, visualizer=None)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
+        best_thres = thres if is_best else best_thres
 
         if ((not args.multiprocessing_distributed or 
             (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)) and
@@ -341,6 +350,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'net_state_dict'    :   net.state_dict(),
                 'margin_state_dict' :   metric.state_dict(),
                 'best_acc1'         :   best_acc1,
+                'best_thres'        :   best_thres,
                 'optimizer'         :   optimizer.state_dict(),
             }, is_best, args.save_dir, filename)
 
@@ -392,8 +402,8 @@ def train(train_loader, net, metric, criterion,
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+        if (i+1) % args.print_freq == 0:
+            progress.display(i + 1)
 
             if visualizer is not None:
                 visualizer.plot_curves({'softmax loss': loss.item()}, 
@@ -402,59 +412,6 @@ def train(train_loader, net, metric, criterion,
                 visualizer.plot_curves({'train accuracy': acc1[0]}, 
                                 iters=(epoch * args.batch_size + i), 
                                 title='Acc@1', xlabel='iters', ylabel='Acc@1')
-
-
-
-def validate(val_loader, net, metric, criterion, 
-             epoch, args, visualizer=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
-
-    # switch to evaluate mode
-    net.eval()
-    metric.eval()
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
-            # compute output
-            output = net(images)
-            loss = criterion(output, target)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % args.print_freq == 0:
-                progress.display(i)
-
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-        
-        if visualizer is not None:
-            visualizer.plot_curves({'Acc@1': top1.avg, 'Acc@5': top5.avg},
-                                iters=epoch, title='test accuracy', 
-                                xlabel='iters', ylabel='Accs')
-                
-
-    return top1.avg
 
 
 def save_checkpoint(state, is_best, save_dir='', filename='checkpoint.pth.tar'):
