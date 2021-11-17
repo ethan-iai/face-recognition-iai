@@ -249,10 +249,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             net.load_state_dict(checkpoint['net_state_dict'], strict=False)
-            metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("==> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            
+            if not args.evaluate:
+                # metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print("==> loaded checkpoint '{}' (epoch {})"
+                    .format(args.resume, checkpoint['epoch']))
         else:
             print("==> no checkpoint found at '{}'".format(args.resume))
 
