@@ -8,14 +8,14 @@ from utils.meter import AverageMeter, ProgressMeter
     
 def accuracy(sims, flags, thres_step=1e-2):
     assert(thres_step > 0 and thres_step < 1)
-    thres_range = np.arange(0.0, 1.0, thres_step)
+    thres_range = np.arange(-1.0, 1.0, thres_step)
 
-    successes = np.array(
-        np.sum((sims > thres) == flags)
+    successes = torch.Tensor([
+        torch.sum((sims > thres) == flags)
         for thres in thres_range
-    )
+    ])
     
-    best_idx = np.argmax(successes)
+    best_idx = torch.argmax(successes)
     best_thres = thres_range[best_idx]
     acc = successes[best_idx] / len(flags)
 
@@ -50,7 +50,7 @@ def validate(val_loader, val_dataset_size,
             
             target = target.cuda(args.gpu, non_blocking=True)
             
-            fliped_images = images.flip(-1) 
+            # fliped_images = images.flip(-1) 
             
             # compute output
             feat = net(images)
@@ -64,27 +64,34 @@ def validate(val_loader, val_dataset_size,
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if i % args.print_freq == 0:
-                progress.display(i)        
+            if (i+1) % args.print_freq == 0:
+                progress.display(i + 1)        
 
     feats = torch.cat(feats, dim=0)
     # fliped_feats = torch.cat(fliped_feats, dim=0)
-    flags = np.array([ 
+    targets = torch.cat(targets, dim=0) 
+
+    flags = torch.Tensor([ 
         targets[i] == targets[j] 
         for (i, j) in pairs
-    ], dtype=int)
+    ]).cuda().type(torch.bool)
 
     assert(len(pairs) == len(flags))
-    sims = np.array([
-        F.cosine_similarity(feats[i: i+1], feats[j, j+1]).item()
+    sims = torch.cat([
+        F.cosine_similarity(feats[i: i+1], feats[j: j+1])
         for (i, j) in pairs
-    ])
+    ]).cuda()
 
     # measure accuracy and record loss
     thres, acc = accuracy(sims, flags, thres_step=5e-3)
 
     # TODO: this should also be done with the ProgressMeter
-    print(f' * Threshold {thres:4.2f} Acc {acc*100:4.2f}')
-                
+    print(f' * Threshold {thres:6.3f}\tAcc {acc*100:4.2f}')
+
+    if visualizer is not None:
+        visualizer.plot_curves({'Accuracy': acc},
+                            iters=epoch, title='test accuracy', 
+                            xlabel='iters', ylabel='Accs')
+    
     return thres, acc
 
