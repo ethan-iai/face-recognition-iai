@@ -251,7 +251,7 @@ def main_worker(gpu, ngpus_per_node, args):
             net.load_state_dict(checkpoint['net_state_dict'], strict=False)
             
             if not args.evaluate:
-                # metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
+                metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 print("==> loaded checkpoint '{}' (epoch {})"
                     .format(args.resume, checkpoint['epoch']))
