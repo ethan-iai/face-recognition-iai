@@ -213,7 +213,7 @@ def main_worker(gpu, ngpus_per_node, args):
             metric = torch.nn.parallel.DistributedDataParallel(metric, device_ids=[args.gpu])
         else:
             net.cuda()
-            metric.cuda(args.gpu)
+            metric.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             net = torch.nn.parallel.DistributedDataParallel(net)
