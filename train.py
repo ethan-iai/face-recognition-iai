@@ -3,7 +3,6 @@ import os
 import random
 import shutil
 import time
-from urllib import parse
 import warnings
 
 import torch
@@ -17,23 +16,24 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torchvision.models as models
 
 from functools import partial
 
 from backbone.cbam import CBAMResNet
 from backbone.attention import ResidualAttentionNet_56, ResidualAttentionNet_92
 
-from margin.InnerProduct import InnerProduct
-from margin.ArcMarginProduct import ArcMarginProduct
-from margin.MultiMarginProduct import MultiMarginProduct
-from margin.CosineMarginProduct import CosineMarginProduct
-from margin.SphereMarginProduct import SphereMarginProduct
+from metrics.InnerProduct import InnerProduct
+from metrics.ArcMarginProduct import ArcMarginProduct
+from metrics.MultiMarginProduct import MultiMarginProduct
+from metrics.CosineMarginProduct import CosineMarginProduct
+from metrics.SphereMarginProduct import SphereMarginProduct
 
 from utils.meter import AverageMeter, ProgressMeter, Meter
-
+from utils.augmentation import RandAugment
 # TODO: implement visualizer
 # from utils.visualize import Visualizer
+
+from test import validate
 
 backbones = {
     'Res50_IR'      :   partial(CBAMResNet, num_layers=50, mode='ir'),
@@ -46,7 +46,7 @@ backbones = {
     'Attention_92'  :   ResidualAttentionNet_92,
 }
 
-margins = {
+metircs = {
     'ArcFace'       :   ArcMarginProduct,
     'MultiMargin'   :   MultiMarginProduct,
     'CosFace'       :   CosineMarginProduct,
@@ -62,12 +62,15 @@ parser.add_argument('--backbone', metavar='BACKBONE', default='Res50_IR',
                     help='model architecture: ' +
                         ' | '.join(backbones.keys()) +
                         ' (default: resnet50)')
-parser.add_argument('--margin', type=str, default='ArcFace', 
+parser.add_argument('--metric', type=str, default='ArcFace', 
+                    choices=metircs.keys(),
                     help='ArcFace, CosFace, SphereFace, MultiMargin, Softmax')
 parser.add_argument('--feature-dim', type=int, default=512, 
                     help='feature dimension, 128 or 512')
-parser.add_argument('--scale-size', type=float, default=32.0,
-                    help='scale size')
+parser.add_argument('-m', '--margin', type=float, default=0.5,
+                    help='margin m in Arc face')
+parser.add_argument('-s', '--scale', type=float, default=32.0,
+                    help='scale s in Arcface')
 parser.add_argument('--n-classes', type=int, default=1000,
                     help='number of classes')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
@@ -92,7 +95,7 @@ parser.add_argument('--save-dir', type=str, default='./model',
                     help='directory to save model checkpoint')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
-parser.add_argument('-s', '--save-freq', default=1000, type=int,
+parser.add_argument('--save-freq', default=1000, type=int,
                     metavar='N', help='save checkpoints frequency (default: 1000)')
 parser.add_argument('--resume', type=str, default='', metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -119,10 +122,12 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
-
+best_thres = 0
 
 def main():
     args = parser.parse_args()
+
+    print(args)
 
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
@@ -161,6 +166,7 @@ def main():
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
+    global best_thres
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -180,11 +186,15 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating backbone '{}'".format(args.backbone))
     net = backbones[args.backbone](feature_dim=args.feature_dim)
     
-    # create margin
-    print("=> creatinig margin '{}'".format(args.margin))
-    margin = margins[args.margin](in_feature=args.feature_dim, 
+    # create metric
+    print("=> creatinig metric '{}'".format(args.metric))
+    kwargs = {
+        's' :   args.scale,
+        'm' :   args.margin
+    }
+    metric = metircs[args.metric](in_feature=args.feature_dim, 
                                   out_feature=args.n_classes, 
-                                  s=args.scale_size)
+                                  **kwargs)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -193,55 +203,60 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             net.cuda(args.gpu)
-            margin.cuda(args.gpu)
+            metric.cuda(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu])
-            margin = torch.nn.parallel.DistributedDataParallel(margin, device_ids=[args.gpu])
+            metric = torch.nn.parallel.DistributedDataParallel(metric, device_ids=[args.gpu])
         else:
             net.cuda()
-            margin.cuda(args.gpu)
+            metric.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             net = torch.nn.parallel.DistributedDataParallel(net)
-            margin = torch.nn.parallel.DistributedDataParallel(margin, device_ids=[args.gpu])
+            metric = torch.nn.parallel.DistributedDataParallel(metric, device_ids=[args.gpu])
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         net = net.cuda(args.gpu)
-        margin = margin.cuda(args.gpu)
+        metric = metric.cuda(args.gpu)
     else:
         net = torch.nn.DataParallel(net).cuda()
-        margin = torch.nn.DataParallel(margin).cuda()
+        metric = torch.nn.DataParallel(metric).cuda()
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     optimizer = torch.optim.SGD([
         {'params': net.parameters(), 'weight_decay': 5e-4},
-        {'params': margin.parameters(), 'weight_decay': 5e-4}
+        {'params': metric.parameters(), 'weight_decay': 5e-4}
     ], args.lr, momentum=args.momentum, nesterov=True)
-    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[6, 11, 16], gamma=0.1)
+
+    # NOTE: set lr decays here
+    exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[400, 800, 1200], gamma=0.1)
 
 
     # optionally resume from a checkpoint
     if len(args.resume) > 0:
         if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            print("==> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location=torch.device(args.gpu))
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
+            # best_thres = checkpoint['best_thres']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            net.load_state_dict(checkpoint['net_state_dict'])
-            margin.load_state_dict(checkpoint['margin_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            net.load_state_dict(checkpoint['net_state_dict'], strict=False)
+            
+            if not args.evaluate:
+                metric.load_state_dict(checkpoint['margin_state_dict'], strict=False)
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print("==> loaded checkpoint '{}' (epoch {})"
+                    .format(args.resume, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print("==> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
@@ -253,7 +268,7 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                      std=[0.5, 0.5, 0.5])
 
-    train_dataset = datasets.ImageFolder(
+    original_train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
             transforms.Resize(128),
@@ -263,7 +278,20 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
-    # TODO: add augmented data
+    augmented_train_dataset = datasets.ImageFolder(
+        traindir,
+        transforms.Compose([
+            transforms.Resize(128),
+            transforms.RandomResizedCrop(112),
+            RandAugment(n=2, m=10),
+            transforms.ToTensor(),
+            normalize
+        ])
+    )
+
+    train_dataset = torch.utils.data.ConcatDataset([
+        original_train_dataset, augmented_train_dataset
+    ])
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -275,18 +303,22 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     # FIXME: centrecrop may corp some useful info 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
+    val_dataset = datasets.ImageFolder(valdir, transforms.Compose([
             transforms.Resize(128),
             transforms.CenterCrop(112),
             transforms.ToTensor(),
             normalize,
-        ])),
+    ]))
+    val_dataset_size = len(val_dataset)
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, net, margin, criterion, args)
+        validate(val_loader, val_dataset_size, net, 
+                 args.start_epoch, args, visualizer=None)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -294,36 +326,38 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, net, margin, criterion, 
+        train(train_loader, net, metric, criterion, 
               optimizer, exp_lr_scheduler, epoch, args)
 
         # adjust_learning_rate
         exp_lr_scheduler.step()
 
         # evaluate on validation set
-        acc1 = validate(val_loader, net, margin, criterion, epoch, args)
+        thres, acc1 = validate(val_loader, val_dataset, net, 
+                               epoch, args, visualizer=None)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
+        best_thres = thres if is_best else best_thres
 
         if ((not args.multiprocessing_distributed or 
             (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)) and
             epoch % args.save_freq == 0):
-            filename="checkpoint-{:06d}.pth.tar".format(epoch)
-            path = os.path.join(args.save_dir, filename)
+            filename = f"checkpoint-{epoch}.pth.tar"
             save_checkpoint({
                 'epoch'             :   epoch + 1,
                 'backbone'          :   args.backbone,
-                'margin'            :   args.margin,
+                'metric'            :   args.metric,
                 'net_state_dict'    :   net.state_dict(),
-                'margin_state_dict' :   margin.state_dict(),
+                'margin_state_dict' :   metric.state_dict(),
                 'best_acc1'         :   best_acc1,
+                'best_thres'        :   best_thres,
                 'optimizer'         :   optimizer.state_dict(),
-            }, is_best, path)
+            }, is_best, args.save_dir, filename)
 
 
-def train(train_loader, net, margin, criterion, 
+def train(train_loader, net, metric, criterion, 
           optimizer, lr_scheduler, epoch, args, visualizer=None):
     batch_time = AverageMeter('Time', ':5.3f')
     data_time = AverageMeter('Data', ':5.3f')
@@ -338,7 +372,7 @@ def train(train_loader, net, margin, criterion,
 
     # switch to train mode
     net.train()
-    margin.train()
+    metric.train()
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -351,7 +385,7 @@ def train(train_loader, net, margin, criterion,
 
         # compute output
         raw_logits = net(images)
-        output = margin(raw_logits, target)
+        output = metric(raw_logits, target)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -370,8 +404,8 @@ def train(train_loader, net, margin, criterion,
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+        if (i+1) % args.print_freq == 0:
+            progress.display(i + 1)
 
             if visualizer is not None:
                 visualizer.plot_curves({'softmax loss': loss.item()}, 
@@ -382,66 +416,13 @@ def train(train_loader, net, margin, criterion,
                                 title='Acc@1', xlabel='iters', ylabel='Acc@1')
 
 
-
-def validate(val_loader, net, margin, criterion, 
-             epoch, args, visualizer=None):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
-
-    # switch to evaluate mode
-    net.eval()
-    margin.eval()
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
-            # compute output
-            output = net(images)
-            loss = criterion(output, target)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % args.print_freq == 0:
-                progress.display(i)
-
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-        
-        if visualizer is not None:
-            visualizer.plot_curves({'Acc@1': top1.avg, 'Acc@5': top5.avg},
-                                iters=epoch, title='test accuracy', 
-                                xlabel='iters', ylabel='Accs')
-                
-
-    return top1.avg
-
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, save_dir='', filename='checkpoint.pth.tar'):
+    file_path = os.path.join(save_dir, filename)
+    torch.save(state, file_path)
     if is_best:
         shutil.copyfile(
-            filename, 
-            os.path.join(os.path.dirname(filename),
-                         'model_best.pth.tar')
+            file_path, 
+            os.path.join(save_dir, 'model_best.pth.tar')
         )
 
 
