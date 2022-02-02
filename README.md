@@ -1,5 +1,5 @@
 # face-recognition-iai
-Implementation with deep learning methods like CosineFace, SphereFace, ArcFace for face recognition task in pattern recognition class in IAI BUAA.
+Implementation with deep learning methods like CosineFace, SphereFace, ArcFace for face recognition task in pattern recognition class in IAI, BUAA.
 
 ## Features
 
@@ -33,7 +33,7 @@ Train
 For example, to train `SeResNet100-IR` with `ArcFace` method and data under `faces95` on `gpu:0`:
 
 ```shell
-python attack.py faces95 \
+python train.py faces95 \
                 --epochs 8000 \
                 --backbone SERes100_IR \
                 --metric ArcFace \
@@ -55,7 +55,7 @@ python attack.py faces95 \
 For example, evaluate trained model under `SeRes100_IR_ArcFace/checkpoint-6000.pth.tar` with data under `faces95/val` on `gpu:0` :
 
 ```shell
-python attack.py faces95 \
+python train.py faces95 \
                     --resume SeRes100_IR_ArcFace/checkpoint-6000.pth.tar \
                     --evaluate \
                     --epochs 8000 \
